@@ -4,23 +4,47 @@ chess_app.py - a complete chess game with a Streamlit front-end.
 Run with:   streamlit run chess_app.py
 Requires:   streamlit >= 1.39  (everything else is the Python standard library)
 
-The file has two clearly separated halves:
+The file has three parts:
 
   1. BACKEND   Piece, Move, Board, Game, ChessAI - pure Python, no Streamlit.
                The position is an 8x8 matrix of strings: "wp" = white pawn,
                "bk" = black king, "" = empty square.  Row 0 is rank 8 and
                column 0 is file a, so grid[6][4] is e2.
-  2. FRONTEND  Streamlit rendering and interaction (clickable board, sidebar
+  2. ONLINE    Store (matchmaking queue + shared games, SQLite) and Heartbeat
+               (presence files) used by the online two-player mode.
+  3. FRONTEND  Streamlit rendering and interaction (clickable board, sidebar
                with settings, captured pieces and move history).
 
-To split it into two files, move everything in section 1 into `chess_engine.py`
-and put `from chess_engine import *` at the top of `app.py`.
+Game modes
+  * Two players (same screen)         - hot-seat play on one device.
+  * Two players (online, auto-match)  - every player gets a UUID. Press Start to be
+        paired with another player who also pressed Start; if nobody shows up in
+        SEARCH_SECONDS a bot takes the other seat. Once playing, each client writes
+        "<uuid>.txt" every HEARTBEAT_SECONDS and consumes (deletes) the opponent's
+        file; if no heartbeat arrives for OFFLINE_AFTER_SECONDS the opponent's seat
+        is handed to a bot so the game can continue.
+  * Play against the computer         - single player vs the built-in engine.
+
+Online state lives in ./chess_online_data (override with CHESS_DATA_DIR), so all
+players must reach the same running server. To play across a network start it with:
+    streamlit run chess_app.py --server.address 0.0.0.0
+The timings can be tuned with the environment variables CHESS_HEARTBEAT_SECONDS,
+CHESS_OFFLINE_AFTER_SECONDS and CHESS_SEARCH_SECONDS.
+
+To split the code into several files, move section 1 into `chess_engine.py` and
+put `from chess_engine import *` at the top of `app.py`.
 """
 
 from __future__ import annotations
 
+import contextlib
+import os
 import random
+import sqlite3
+import time
+import uuid
 from collections import Counter
+from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import streamlit as st
@@ -399,6 +423,17 @@ class Game:
         self.position_counts[self._position_key()] += 1
         self._refresh_status()
 
+    @classmethod
+    def from_moves(cls, ucis: List[str]) -> "Game":
+        """Rebuild a game by replaying moves given in UCI notation ('e2e4', 'e7e8q')."""
+        game = cls()
+        for uci in ucis:
+            move = game.move_from_uci(uci)
+            if move is None:
+                raise ValueError(f"Illegal move in record: {uci}")
+            game.make_move(move)
+        return game
+
     # ---- queries ------------------------------------------------------------
     @property
     def is_over(self) -> bool:
@@ -529,7 +564,7 @@ class Game:
                 text += square_name(*move.start)
         return text + ("x" if move.captured else "") + dest
 
-    def pgn(self) -> str:
+    def pgn(self, result: Optional[str] = None) -> str:
         parts = []
         for i, e in enumerate(self.history):
             if e.color == WHITE:
@@ -538,7 +573,7 @@ class Game:
                 parts.append(f"{e.number}... {e.san}")
             else:
                 parts.append(e.san)
-        parts.append(self.result)
+        parts.append(result or self.result)
         return " ".join(parts)
 
 
@@ -672,10 +707,254 @@ class ChessAI:
 
 
 # =============================================================================
-# 2. FRONTEND (Streamlit)
+# 2. ONLINE PLAY: shared storage (SQLite) and heartbeat files
+# =============================================================================
+
+DATA_DIR = Path(os.environ.get("CHESS_DATA_DIR") or Path(__file__).resolve().parent / "chess_online_data")
+HEARTBEAT_SECONDS = float(os.environ.get("CHESS_HEARTBEAT_SECONDS", "3"))  # how often <uuid>.txt is written
+OFFLINE_AFTER_SECONDS = float(os.environ.get("CHESS_OFFLINE_AFTER_SECONDS", "15"))  # no heartbeat for this long -> bot
+SEARCH_SECONDS = float(os.environ.get("CHESS_SEARCH_SECONDS", "10"))  # how long Start looks for a human
+QUEUE_STALE_SECONDS = 5.0  # a searching player who hasn't polled for this long is ignored
+BOT_ID = "bot"  # seat occupant used instead of a player UUID
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS queue (
+    pid TEXT PRIMARY KEY,            -- player UUID that pressed Start
+    since REAL NOT NULL,             -- when Start was pressed
+    seen REAL NOT NULL,              -- last time this player's client polled (liveness)
+    game_id TEXT                     -- filled in when a partner has been found
+);
+CREATE TABLE IF NOT EXISTS games (
+    id TEXT PRIMARY KEY,
+    white TEXT NOT NULL,             -- player UUID or BOT_ID
+    black TEXT NOT NULL,
+    moves TEXT NOT NULL DEFAULT '',  -- space separated UCI moves; the full game is replayed from this
+    result TEXT NOT NULL DEFAULT '', -- '' while playing, else '1-0', '0-1', '1/2-1/2' or '*'
+    reason TEXT NOT NULL DEFAULT '', -- checkmate, stalemate, resignation, abandoned, ...
+    created REAL NOT NULL,
+    updated REAL NOT NULL
+);
+"""
+
+
+class Heartbeat:
+    """File-based presence signal.
+
+    While a game is running each player's client writes a file called
+    ``<player-uuid>.txt`` every HEARTBEAT_SECONDS. The opponent's client keeps
+    looking for that file; when it finds one it checks it belongs to this game
+    and is fresh, then deletes it. A successful check means "the other player is
+    online". If the checks keep failing the fail-safe hands the seat to a bot.
+    """
+
+    def __init__(self, directory: Path) -> None:
+        self.dir = Path(directory)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.purge()
+
+    def path(self, pid: str) -> Path:
+        return self.dir / f"{pid}.txt"
+
+    def beat(self, pid: str, game_id: str) -> None:
+        """Generate this player's heartbeat file (written atomically)."""
+        tmp = self.dir / f"{pid}.tmp"
+        try:
+            tmp.write_text(f"{game_id} {time.time():.3f}")
+            os.replace(tmp, self.path(pid))
+        except OSError:
+            pass  # try again on the next beat
+
+    def consume(self, pid: str, game_id: str, max_age: float) -> bool:
+        """Look for `pid`'s heartbeat file. If present it is deleted; returns True
+        only when its content was valid (right game, recent timestamp)."""
+        path = self.path(pid)
+        try:
+            text = path.read_text()
+        except OSError:
+            return False  # no file: nothing received this time
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        try:
+            gid, stamp = text.split()
+            return gid == game_id and time.time() - float(stamp) <= max_age
+        except ValueError:
+            return False
+
+    def clear(self, pid: str) -> None:
+        for suffix in (".txt", ".tmp"):
+            try:
+                (self.dir / f"{pid}{suffix}").unlink()
+            except OSError:
+                pass
+
+    def purge(self, max_age: float = 3600.0) -> None:
+        """Remove leftovers from players who vanished long ago."""
+        for p in self.dir.glob("*.*"):
+            try:
+                if p.suffix in (".txt", ".tmp") and time.time() - p.stat().st_mtime > max_age:
+                    p.unlink()
+            except OSError:
+                pass
+
+
+class Store:
+    """SQLite storage shared by every player's session: the matchmaking queue and
+    the online games (as a list of moves). Each call uses its own short-lived
+    connection, so it is safe from many Streamlit sessions (threads) at once, and
+    writes run in IMMEDIATE transactions so two players can never race each other."""
+
+    def __init__(self, directory: Path) -> None:
+        Path(directory).mkdir(parents=True, exist_ok=True)
+        self.path = str(Path(directory) / "chess_online.db")
+        with self._db() as con:
+            try:
+                con.execute("PRAGMA journal_mode=WAL")
+            except sqlite3.DatabaseError:
+                pass
+            con.executescript(_SCHEMA)
+
+    @contextlib.contextmanager
+    def _db(self, write: bool = False):
+        con = sqlite3.connect(self.path, timeout=15, isolation_level=None)
+        con.row_factory = sqlite3.Row
+        try:
+            if write:
+                con.execute("BEGIN IMMEDIATE")
+            yield con
+            if write:
+                con.execute("COMMIT")
+        except BaseException:
+            if write:
+                try:
+                    con.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+            raise
+        finally:
+            con.close()
+
+    # ---- matchmaking --------------------------------------------------------
+    def enqueue(self, pid: str, now: Optional[float] = None) -> None:
+        """The player pressed Start: join the waiting list."""
+        now = time.time() if now is None else now
+        with self._db(write=True) as con:
+            con.execute("INSERT OR REPLACE INTO queue(pid, since, seen, game_id) VALUES (?,?,?,NULL)", (pid, now, now))
+
+    def poll_queue(self, pid: str, now: Optional[float] = None) -> Tuple[str, Optional[str], float]:
+        """Advance this player's search. Returns (state, game_id, seconds_waited) where
+        state is 'idle' (not searching), 'searching', 'matched' (human opponent) or
+        'bot' (nobody else pressed Start in time, so a bot was assigned)."""
+        now = time.time() if now is None else now
+        with self._db(write=True) as con:
+            con.execute("DELETE FROM queue WHERE seen < ?", (now - 60,))
+            me = con.execute("SELECT * FROM queue WHERE pid=?", (pid,)).fetchone()
+            if me is None:
+                return "idle", None, 0.0
+            waited = now - me["since"]
+            if me["game_id"]:  # the other player's poll already created our game
+                con.execute("DELETE FROM queue WHERE pid=?", (pid,))
+                return "matched", me["game_id"], waited
+            con.execute("UPDATE queue SET seen=? WHERE pid=?", (now, pid))
+            partner = con.execute(
+                "SELECT pid FROM queue WHERE pid != ? AND game_id IS NULL AND seen > ? ORDER BY since LIMIT 1",
+                (pid, now - QUEUE_STALE_SECONDS),
+            ).fetchone()
+            if partner:
+                gid = self._new_game(con, pid, partner["pid"], now)
+                con.execute("UPDATE queue SET game_id=? WHERE pid=?", (gid, partner["pid"]))
+                con.execute("DELETE FROM queue WHERE pid=?", (pid,))
+                return "matched", gid, waited
+            if waited >= SEARCH_SECONDS:  # nobody else pressed Start: play a bot
+                gid = self._new_game(con, pid, BOT_ID, now)
+                con.execute("DELETE FROM queue WHERE pid=?", (pid,))
+                return "bot", gid, waited
+            return "searching", None, waited
+
+    def cancel_search(self, pid: str) -> Optional[str]:
+        """Leave the waiting list. If a game was created for us in the meantime its id is returned."""
+        with self._db(write=True) as con:
+            row = con.execute("SELECT game_id FROM queue WHERE pid=?", (pid,)).fetchone()
+            con.execute("DELETE FROM queue WHERE pid=?", (pid,))
+            return row["game_id"] if row else None
+
+    @staticmethod
+    def _new_game(con: sqlite3.Connection, a: str, b: str, now: float) -> str:
+        white, black = random.sample([a, b], 2)  # colours are assigned at random
+        gid = uuid.uuid4().hex[:12]
+        con.execute("INSERT INTO games(id, white, black, created, updated) VALUES (?,?,?,?,?)",
+                    (gid, white, black, now, now))
+        return gid
+
+    # ---- games --------------------------------------------------------------
+    def get_game(self, gid: str) -> Optional[dict]:
+        with self._db() as con:
+            row = con.execute("SELECT * FROM games WHERE id=?", (gid,)).fetchone()
+        return dict(row) if row else None
+
+    def submit_move(self, gid: str, actor: str, uci: str, as_bot: bool = False) -> Tuple[bool, str]:
+        """Validate and store one move. `actor` is the UUID of the player's client.
+        With as_bot=True the actor moves for the bot seat (the bot is driven by the
+        remaining human's client)."""
+        with self._db(write=True) as con:
+            row = con.execute("SELECT * FROM games WHERE id=?", (gid,)).fetchone()
+            if row is None:
+                return False, "That game no longer exists."
+            if row["result"]:
+                return False, "This game is already over."
+            if actor not in (row["white"], row["black"]):
+                return False, "You are no longer a player in this game."
+            game = Game.from_moves(row["moves"].split())
+            if as_bot:
+                color = WHITE if row["white"] == BOT_ID else BLACK if row["black"] == BOT_ID else None
+                if color is None or game.turn != color:
+                    return False, "It is not the bot's turn."
+            else:
+                color = WHITE if row["white"] == actor else BLACK
+                if game.turn != color:
+                    return False, "It's not your turn."
+            move = game.move_from_uci(uci)
+            if move is None:
+                return False, "That move is not legal in the current position."
+            game.make_move(move)
+            result, reason = (game.result, game.status) if game.is_over else ("", "")
+            con.execute("UPDATE games SET moves=?, result=?, reason=?, updated=? WHERE id=?",
+                        ((row["moves"] + " " + uci).strip(), result, reason, time.time(), gid))
+        return True, "ok"
+
+    def resign(self, gid: str, pid: str) -> Tuple[bool, str]:
+        with self._db(write=True) as con:
+            row = con.execute("SELECT * FROM games WHERE id=?", (gid,)).fetchone()
+            if row is None or row["result"] or pid not in (row["white"], row["black"]):
+                return False, "Nothing to resign."
+            result = "0-1" if row["white"] == pid else "1-0"
+            con.execute("UPDATE games SET result=?, reason='resignation', updated=? WHERE id=?", (result, time.time(), gid))
+        return True, "ok"
+
+    def replace_with_bot(self, gid: str, pid: str) -> bool:
+        """Fail-safe / leaving: give `pid`'s seat to the bot so the game can go on.
+        Returns False if there was nothing to replace (already done, or game over).
+        If no human is left afterwards the game is closed as abandoned."""
+        with self._db(write=True) as con:
+            row = con.execute("SELECT * FROM games WHERE id=?", (gid,)).fetchone()
+            if row is None or row["result"] or pid == BOT_ID or pid not in (row["white"], row["black"]):
+                return False
+            seat = "white" if row["white"] == pid else "black"
+            other = row["black"] if seat == "white" else row["white"]
+            if other == BOT_ID:  # nobody human left
+                con.execute("UPDATE games SET result='*', reason='abandoned', updated=? WHERE id=?", (time.time(), gid))
+            else:
+                con.execute(f"UPDATE games SET {seat}=?, updated=? WHERE id=?", (BOT_ID, time.time(), gid))
+        return True
+
+
+# =============================================================================
+# 3. FRONTEND (Streamlit)
 # =============================================================================
 
 MODE_2P = "Two players (same screen)"
+MODE_ONLINE = "Two players (online, auto-match)"
 MODE_AI = "Play against the computer"
 ORIENTATIONS = ["Auto", "White at bottom", "Black at bottom", "Rotate every turn"]
 COLOR_NAME = {WHITE: "White", BLACK: "Black"}
@@ -755,13 +1034,36 @@ def build_board_css(game: Game, selected: Optional[Square], targets: Dict[Square
 
 
 # ---- session state & callbacks ----------------------------------------------
+@st.cache_resource
+def get_store() -> Store:
+    return Store(DATA_DIR)
+
+
+@st.cache_resource
+def get_heartbeat() -> Heartbeat:
+    return Heartbeat(DATA_DIR / "heartbeats")
+
+
 def init_state() -> None:
     ss = st.session_state
     if "game" not in ss:
-        ss.game = Game()
+        ss.game = Game()  # the local game (two players on one screen / vs computer)
         ss.ai = ChessAI()
-        ss.selected = None  # (row, col) of the selected piece
-        ss.pending_promotion = None  # (from_square, to_square) waiting for a piece choice
+    defaults = {
+        "selected": None,  # (row, col) of the selected piece
+        "pending_promotion": None,  # (from_square, to_square) waiting for a piece choice
+        "pid": str(uuid.uuid4()),  # this player's identity in online games
+        "online_phase": "idle",  # idle -> searching -> game
+        "online_id": None,  # id of the online game being played
+        "online_row": None,  # last game record read from storage
+        "online_cache": None,  # {"id", "moves", "game"}: replayed Game for that record
+        "online_token": None,  # fingerprint of the record, used to detect changes
+        "hb_game": None, "hb_last_write": 0.0, "opp_last_seen": 0.0,  # heartbeat bookkeeping
+        "confirm_resign": False,
+        "notice": None,  # (kind, text) shown once on the next run
+    }
+    for key, value in defaults.items():
+        ss.setdefault(key, value)
 
 
 def ai_color() -> Optional[str]:
@@ -777,23 +1079,70 @@ def is_ai_turn() -> bool:
     return ac is not None and game.turn == ac and not game.is_over
 
 
+def my_color(row: Optional[dict] = None) -> Optional[str]:
+    """Which colour this browser plays in the online game (None if it has no seat)."""
+    ss = st.session_state
+    row = row or ss.get("online_row")
+    if not row:
+        return None
+    return WHITE if row["white"] == ss.pid else BLACK if row["black"] == ss.pid else None
+
+
+def bot_color(row: dict) -> Optional[str]:
+    return WHITE if row["white"] == BOT_ID else BLACK if row["black"] == BOT_ID else None
+
+
+def current_game() -> Optional[Game]:
+    ss = st.session_state
+    if ss.get("mode") == MODE_ONLINE:
+        cache = ss.get("online_cache")
+        return cache["game"] if cache and ss.get("online_id") else None
+    return ss.game
+
+
+def can_move_now(game: Optional[Game]) -> bool:
+    """May the person at this screen move a piece right now?"""
+    ss = st.session_state
+    if game is None or game.is_over:
+        return False
+    if ss.get("mode") == MODE_ONLINE:
+        row = ss.get("online_row")
+        return bool(row) and not row["result"] and my_color(row) == game.turn
+    return not is_ai_turn()
+
+
 def board_flipped() -> bool:
     ss = st.session_state
-    choice = ss.get("orientation", "Auto")
+    choice, mode = ss.get("orientation", "Auto"), ss.get("mode")
     if choice == "White at bottom":
         return False
     if choice == "Black at bottom":
         return True
-    if choice == "Rotate every turn" and ss.get("mode") == MODE_2P:
+    if mode == MODE_ONLINE:
+        return my_color() == BLACK  # you always see your own pieces at the bottom
+    if choice == "Rotate every turn" and mode == MODE_2P:
         return ss.game.turn == BLACK
-    return ss.get("mode") == MODE_AI and ss.get("human_color") == "Black"  # "Auto"
+    return mode == MODE_AI and ss.get("human_color") == "Black"  # "Auto"
+
+
+def play_move(move: Move) -> None:
+    ss = st.session_state
+    if ss.get("mode") == MODE_ONLINE:
+        try:
+            ok, msg = get_store().submit_move(ss.online_id, ss.pid, move.uci)
+        except sqlite3.Error:
+            ok, msg = False, "The game storage is busy, please try again."
+        if not ok:
+            ss.notice = ("warning", msg)
+    else:
+        ss.game.make_move(move)
 
 
 def on_square_click(r: int, c: int) -> None:
     ss = st.session_state
-    game = ss.game
+    game = current_game()
     ss.pending_promotion = None
-    if game.is_over or is_ai_turn():
+    if game is None or not can_move_now(game):
         return
     sel = ss.selected
     if sel is not None:
@@ -802,7 +1151,7 @@ def on_square_click(r: int, c: int) -> None:
             if len(candidates) > 1:  # several promotion choices: ask which piece
                 ss.pending_promotion = (sel, (r, c))
             else:
-                game.make_move(candidates[0])
+                play_move(candidates[0])
                 ss.selected = None
             return
     piece = game.board.grid[r][c]
@@ -812,8 +1161,8 @@ def on_square_click(r: int, c: int) -> None:
 def choose_promotion(kind: str) -> None:
     ss = st.session_state
     start, end = ss.pending_promotion
-    move = next(m for m in ss.game.legal_moves_from(start) if m.end == end and m.promotion == kind)
-    ss.game.make_move(move)
+    move = next(m for m in current_game().legal_moves_from(start) if m.end == end and m.promotion == kind)
+    play_move(move)
     ss.selected = ss.pending_promotion = None
 
 
@@ -843,6 +1192,142 @@ def undo_move() -> None:
     ss.selected = ss.pending_promotion = None
 
 
+# ---- online callbacks -------------------------------------------------------
+def reset_online_view() -> None:
+    ss = st.session_state
+    ss.online_phase, ss.online_id, ss.online_row, ss.online_cache, ss.online_token = "idle", None, None, None, None
+    ss.hb_game, ss.hb_last_write, ss.confirm_resign = None, 0.0, False
+    ss.selected = ss.pending_promotion = None
+
+
+def cb_start() -> None:
+    """The Start button: join the matchmaking queue under this player's UUID."""
+    ss = st.session_state
+    reset_online_view()
+    get_store().enqueue(ss.pid)
+    ss.online_phase = "searching"
+
+
+def cb_cancel_search() -> None:
+    ss = st.session_state
+    gid = get_store().cancel_search(ss.pid)
+    reset_online_view()
+    if gid:  # a partner was found at the very last moment: play that game
+        ss.online_phase, ss.online_id = "game", gid
+
+
+def cb_ask_resign() -> None:
+    st.session_state.confirm_resign = True
+
+
+def cb_cancel_resign() -> None:
+    st.session_state.confirm_resign = False
+
+
+def cb_resign() -> None:
+    ss = st.session_state
+    get_store().resign(ss.online_id, ss.pid)
+    ss.confirm_resign = False
+
+
+def cb_leave() -> None:
+    """Leave the game. If it is still running, a bot takes this player's seat."""
+    ss = st.session_state
+    if ss.online_id:
+        get_store().replace_with_bot(ss.online_id, ss.pid)
+    get_heartbeat().clear(ss.pid)
+    reset_online_view()
+
+
+# ---- online: matchmaking, polling and heartbeat ------------------------------
+def game_token(row: Optional[dict]) -> str:
+    """Fingerprint of everything that changes what the board should show."""
+    if row is None:
+        return "missing"
+    return repr((row["white"], row["black"], row["moves"], row["result"], row["reason"]))
+
+
+@st.fragment(run_every=1)
+def online_tick() -> None:
+    """Runs once a second while the online screen is open.
+
+    searching: asks the queue for a partner (or a bot once SEARCH_SECONDS pass).
+    game:      (1) notices opponent moves, (2) writes our <uuid>.txt heartbeat every
+               HEARTBEAT_SECONDS, (3) looks for the opponent's file and deletes it,
+               (4) fail-safe: no heartbeat for OFFLINE_AFTER_SECONDS -> bot takes over.
+    """
+    ss = st.session_state
+    store, hb = get_store(), get_heartbeat()
+    now = time.time()
+
+    if ss.get("online_phase") == "searching":
+        state, gid, waited = store.poll_queue(ss.pid)
+        if state in ("matched", "bot"):
+            ss.online_phase, ss.online_id = "game", gid
+            ss.notice = (("success", "Opponent found - the game begins!") if state == "matched" else
+                         ("info", f"Nobody else pressed Start within {SEARCH_SECONDS:g} seconds, "
+                                  f"so you are playing against a bot."))
+            st.rerun()
+        if state == "idle":
+            ss.online_phase = "idle"
+            st.rerun()
+        st.info(f"🔎 Searching for another player who pressed Start… {int(waited)}s of {SEARCH_SECONDS:g}s. "
+                f"If nobody shows up, a bot will play with you.")
+        return
+
+    gid = ss.get("online_id")
+    if ss.get("online_phase") != "game" or not gid:
+        return
+    row = store.get_game(gid)
+    if game_token(row) != ss.online_token:  # opponent moved, seat changed or game ended
+        st.rerun()
+    if row["result"] or my_color(row) is None:
+        if ss.hb_last_write:
+            hb.clear(ss.pid)  # game finished: stop sending heartbeats
+            ss.hb_last_write = 0.0
+        return
+    opp = row["black"] if row["white"] == ss.pid else row["white"]
+    if opp == BOT_ID:
+        st.caption("🤖 Your opponent is a bot.")
+        return
+
+    if now - ss.hb_last_write >= HEARTBEAT_SECONDS:  # (2) generate our heartbeat file
+        hb.beat(ss.pid, gid)
+        ss.hb_last_write = now
+    if hb.consume(opp, gid, OFFLINE_AFTER_SECONDS):  # (3) opponent's file found, checked and deleted
+        ss.opp_last_seen = now
+    silent = now - ss.opp_last_seen
+    if silent > OFFLINE_AFTER_SECONDS:  # (4) fail-safe
+        if store.replace_with_bot(gid, opp):
+            ss.notice = ("warning", "Your opponent's heartbeat stopped, so a bot has taken over their seat "
+                                    "and the game continues.")
+        st.rerun()
+    light = "🟢" if silent <= 2 * HEARTBEAT_SECONDS + 1 else "🟡"
+    st.caption(f"💓 Your heartbeat was sent {now - ss.hb_last_write:.0f}s ago · {light} opponent's heartbeat "
+               f"last received {silent:.0f}s ago (a bot takes over after {OFFLINE_AFTER_SECONDS:g}s of silence)")
+
+
+def sync_online() -> Optional[Game]:
+    """Load the shared game record and bring this session's Game object up to date."""
+    ss = st.session_state
+    row = get_store().get_game(ss.online_id) if ss.online_id else None
+    if row is None:
+        reset_online_view()
+        return None
+    if ss.hb_game != row["id"]:  # first time we look at this game: start the heartbeat clock
+        ss.hb_game, ss.hb_last_write, ss.opp_last_seen = row["id"], 0.0, time.time()
+    ss.online_row, ss.online_token = row, game_token(row)
+    cache = ss.online_cache
+    if not cache or cache["id"] != row["id"] or not row["moves"].startswith(cache["moves"]):
+        cache = {"id": row["id"], "moves": "", "game": Game()}
+    game = cache["game"]
+    for uci in row["moves"][len(cache["moves"]):].split():  # only replay the new moves
+        game.make_move(game.move_from_uci(uci))
+    cache["moves"] = row["moves"]
+    ss.online_cache = cache
+    return game
+
+
 # ---- rendering ---------------------------------------------------------------
 def piece_span(code: str, size: str = "1.6rem") -> str:
     p = Piece(code)
@@ -853,22 +1338,27 @@ def piece_span(code: str, size: str = "1.6rem") -> str:
 
 def render_settings() -> None:
     sb = st.sidebar
+    ss = st.session_state
     sb.title("♟️ Chess")
-    sb.radio("Game mode", [MODE_2P, MODE_AI], key="mode")
-    vs_ai = st.session_state.mode == MODE_AI
-    sb.radio("You play as", ["White", "Black"], key="human_color", horizontal=True, disabled=not vs_ai)
-    sb.selectbox("Computer level", list(ChessAI.LEVELS), index=2, key="level", disabled=not vs_ai)
+    sb.radio("Game mode", [MODE_2P, MODE_ONLINE, MODE_AI], key="mode")
+    mode = ss.mode
+    if mode == MODE_ONLINE:
+        with sb.expander("Your player ID (UUID)"):
+            st.code(ss.pid, language=None)
+    sb.radio("You play as", ["White", "Black"], key="human_color", horizontal=True, disabled=mode != MODE_AI)
+    sb.selectbox("Computer / bot level", list(ChessAI.LEVELS), index=2, key="level", disabled=mode == MODE_2P)
     sb.selectbox("Board orientation", ORIENTATIONS, key="orientation")
-    sb.button("🔄 New game", key="new_game_sidebar", on_click=new_game)
+    if mode != MODE_ONLINE:
+        sb.button("🔄 New game", key="new_game_sidebar", on_click=new_game)
 
 
-def render_status(game: Game) -> None:
-    ac = ai_color()
-    turn = COLOR_NAME[game.turn]
+def render_status(game: Game, labels: Dict[str, str], me: Optional[str] = None) -> None:
+    """Banner for the position. `labels` maps each colour to the text shown for it and
+    `me` is the colour of the person looking (used to colour win/loss banners)."""
     if game.status == "checkmate":
         winner = opponent(game.turn)
-        message = f"🏁 Checkmate. {COLOR_NAME[winner]} wins."
-        (st.error if ac is not None and game.turn != ac else st.success)(message)  # red only if the human lost
+        message = f"🏁 Checkmate. {labels[winner]} wins."
+        (st.error if me is not None and winner != me else st.success)(message)  # red only if I lost
     elif game.status == "stalemate":
         st.info("🤝 Stalemate. The game is a draw.")
     elif game.status == "insufficient":
@@ -878,9 +1368,8 @@ def render_status(game: Game) -> None:
     elif game.status == "repetition":
         st.info("🤝 Draw by threefold repetition.")
     else:
-        who = "" if ac is None else (" (computer)" if game.turn == ac else " (you)")
         prefix = "⚠️ Check! " if game.status == "check" else ""
-        (st.warning if game.status == "check" else st.info)(f"{prefix}{turn} to move{who}")
+        (st.warning if game.status == "check" else st.info)(f"{prefix}{labels[game.turn]} to move")
 
 
 def render_promotion_picker(game: Game) -> None:
@@ -906,6 +1395,38 @@ def render_board(game: Game, flipped: bool) -> None:
                 label = Piece(piece).symbol if piece else BLANK
                 with col:
                     st.button(label, key=f"sq_{r}_{c}", on_click=on_square_click, args=(r, c))
+
+
+def board_caption(game: Game) -> Optional[str]:
+    ss = st.session_state
+    if ss.selected and not ss.pending_promotion:
+        return (f"Selected {square_name(*ss.selected)}. Green dots show where it can move; "
+                f"click it again to deselect.")
+    if can_move_now(game):
+        return "Click one of your pieces, then click where it should go."
+    return None
+
+
+def render_game_area(game: Game, flipped: bool, status_fn, controls_fn) -> None:
+    """Status banner, board and controls, shared by every game mode."""
+    ss = st.session_state
+    if ss.selected is not None:  # drop a stale selection (turn changed, game ended, ...)
+        piece = game.board.grid[ss.selected[0]][ss.selected[1]]
+        if not can_move_now(game) or not piece or piece[0] != game.turn:
+            ss.selected = ss.pending_promotion = None
+    moves = game.legal_moves_from(ss.selected) if ss.selected else []
+    targets = {m.end: bool(m.captured) for m in moves}
+
+    with st.container(key="css_holder"):
+        st.markdown(f"<style>{build_board_css(game, ss.selected, targets, flipped)}</style>", unsafe_allow_html=True)
+    with st.container(key="game_area"):
+        status_fn()
+        render_promotion_picker(game)
+        render_board(game, flipped)
+        caption = board_caption(game)
+        if caption:
+            st.caption(caption)
+        controls_fn()
 
 
 def render_captured(game: Game) -> None:
@@ -944,7 +1465,7 @@ def history_html(game: Game) -> str:
             f"{body}</table></div>")
 
 
-def render_sidebar_info(game: Game) -> None:
+def render_sidebar_info(game: Game, result: Optional[str] = None) -> None:
     sb = st.sidebar
     sb.divider()
     render_captured(game)
@@ -952,8 +1473,8 @@ def render_sidebar_info(game: Game) -> None:
     sb.subheader("Move history")
     sb.markdown(history_html(game), unsafe_allow_html=True)
     with sb.expander("PGN"):
-        st.code(game.pgn(), language=None)
-        st.download_button("Download PGN", data=game.pgn(), file_name="game.pgn", key="download_pgn")
+        st.code(game.pgn(result), language=None)
+        st.download_button("Download PGN", data=game.pgn(result), file_name="game.pgn", key="download_pgn")
     with sb.expander("Board matrix (backend state)"):
         st.code(game.board.matrix_text(), language=None)
         st.caption('Each cell holds a piece code such as "wp" or "bk"; empty squares are "" (shown as "..").')
@@ -969,43 +1490,29 @@ def check_streamlit_version() -> None:
         pass
 
 
-def main() -> None:
-    st.set_page_config(page_title="Chess", page_icon="♟️", layout="centered", initial_sidebar_state="auto")
-    check_streamlit_version()
-    init_state()
+# ---- the three game modes ------------------------------------------------------
+def local_labels() -> Dict[str, str]:
+    ac = ai_color()
+    if ac is None:
+        return dict(COLOR_NAME)
+    return {ac: f"{COLOR_NAME[ac]} (computer)", opponent(ac): f"{COLOR_NAME[opponent(ac)]} (you)"}
+
+
+def render_local_controls() -> None:
+    left, right = st.columns(2)
+    with left:
+        st.button("🔄 New game", key="new_game", on_click=new_game)
+    with right:
+        st.button("↩️ Undo move", key="undo", on_click=undo_move, disabled=not can_undo())
+
+
+def run_local() -> None:
+    """Two players on one screen, or one player against the computer."""
     ss = st.session_state
-    render_settings()
-
     game: Game = ss.game
-    # drop a stale selection (e.g. after switching sides or modes)
-    if ss.selected is not None:
-        piece = game.board.grid[ss.selected[0]][ss.selected[1]]
-        if game.is_over or not piece or piece[0] != game.turn:
-            ss.selected = None
-    moves = game.legal_moves_from(ss.selected) if ss.selected else []
-    targets = {m.end: bool(m.captured) for m in moves}
-    flipped = board_flipped()
-
-    with st.container(key="css_holder"):
-        st.markdown(f"<style>{build_board_css(game, ss.selected, targets, flipped)}</style>", unsafe_allow_html=True)
-
-    with st.container(key="game_area"):
-        render_status(game)
-        render_promotion_picker(game)
-        render_board(game, flipped)
-
-        if ss.selected and not ss.pending_promotion:
-            st.caption(f"Selected {square_name(*ss.selected)}. Green dots show where it can move; "
-                       f"click it again to deselect.")
-        elif not game.is_over and not is_ai_turn():
-            st.caption("Click one of your pieces, then click where it should go.")
-
-        left, right = st.columns(2)
-        with left:
-            st.button("🔄 New game", key="new_game", on_click=new_game)
-        with right:
-            st.button("↩️ Undo move", key="undo", on_click=undo_move, disabled=not can_undo())
-
+    ac = ai_color()
+    labels, me = local_labels(), (None if ac is None else opponent(ac))
+    render_game_area(game, board_flipped(), lambda: render_status(game, labels, me), render_local_controls)
     render_sidebar_info(game)
 
     # Computer's turn: runs after the board is drawn so the human's move is already visible.
@@ -1015,6 +1522,118 @@ def main() -> None:
             if move:
                 game.make_move(move)
         st.rerun()
+
+
+def online_labels(row: dict) -> Dict[str, str]:
+    def who(seat: str, color: str) -> str:
+        if seat == BOT_ID:
+            return f"{COLOR_NAME[color]} (bot)"
+        if seat == st.session_state.pid:
+            return f"{COLOR_NAME[color]} (you)"
+        return f"{COLOR_NAME[color]} (player {seat[:4]})"
+    return {WHITE: who(row["white"], WHITE), BLACK: who(row["black"], BLACK)}
+
+
+def render_online_menu() -> None:
+    st.subheader("Play online")
+    st.write(f"Press **Start** to look for another player who has also pressed Start. If nobody else "
+             f"turns up within {SEARCH_SECONDS:g} seconds you are given a bot opponent, so you can always play.")
+    st.button("▶️ Start", key="start_online", type="primary", on_click=cb_start)
+    st.caption(f"Your player ID: `{st.session_state.pid}`")
+    st.caption("To try it with a friend, open this app on a second device or browser tab, choose this same "
+               "mode and press Start on both within a few seconds.")
+
+
+def render_searching() -> None:
+    st.subheader("Finding an opponent…")
+    online_tick()
+    st.button("Cancel", key="cancel_search", on_click=cb_cancel_search)
+
+
+def render_online_status(game: Game, row: dict, me: str) -> None:
+    labels = online_labels(row)
+    if row["reason"] == "resignation":
+        winner = WHITE if row["result"] == "1-0" else BLACK
+        (st.success if winner == me else st.error)(
+            f"🏳️ {labels[opponent(winner)]} resigned. {labels[winner]} wins.")
+    elif row["reason"] == "abandoned":
+        st.info("The game was abandoned because both players left.")
+    else:
+        render_status(game, labels, me)
+
+
+def render_online_controls(game: Game, row: dict) -> None:
+    ss = st.session_state
+    online_tick()  # live heartbeat / connection line (and polling for the opponent's move)
+    if row["result"] or game.is_over:
+        st.button("Back to menu", key="leave_game", on_click=cb_leave)
+    elif ss.confirm_resign:
+        st.warning("Resign this game? Your opponent will win.")
+        yes, no = st.columns(2)
+        yes.button("Yes, resign", key="resign_yes", on_click=cb_resign)
+        no.button("Keep playing", key="resign_no", on_click=cb_cancel_resign)
+    else:
+        left, right = st.columns(2)
+        left.button("🏳️ Resign", key="resign", on_click=cb_ask_resign)
+        right.button("🚪 Leave game", key="leave_game", on_click=cb_leave,
+                     help="Leave the game. A bot takes your seat and your opponent can keep playing.")
+
+
+def drive_bot(game: Game, row: dict) -> None:
+    """The remaining human's client plays the moves of a bot seat."""
+    ss = st.session_state
+    bc = bot_color(row)
+    if bc is None or row["result"] or game.is_over or game.turn != bc:
+        return
+    with st.spinner("Bot is thinking…"):
+        move = ss.ai.choose_move(game, ChessAI.LEVELS[ss.level])
+        ok = bool(move) and get_store().submit_move(ss.online_id, ss.pid, move.uci, as_bot=True)[0]
+    if ok:
+        st.rerun()
+
+
+def render_online_game(game: Game) -> None:
+    ss = st.session_state
+    row = ss.online_row
+    me = my_color(row)
+    if me is None:
+        st.warning("⚠️ Your heartbeat stopped for too long, so a bot took your seat and the game carried on "
+                   "without you. You can start a new game.")
+        st.button("Back to menu", key="leave_game", on_click=cb_leave)
+        return
+    render_game_area(game, board_flipped(), lambda: render_online_status(game, row, me),
+                     lambda: render_online_controls(game, row))
+    render_sidebar_info(game, row["result"] if row["result"] in ("1-0", "0-1", "1/2-1/2") else None)
+    drive_bot(game, row)
+
+
+def run_online() -> None:
+    """Online mode: menu (Start) -> searching -> game."""
+    ss = st.session_state
+    if ss.notice:
+        kind, text = ss.notice
+        ss.notice = None
+        getattr(st, kind)(text)
+    if ss.online_phase == "searching":
+        render_searching()
+        return
+    if ss.online_phase == "game":
+        game = sync_online()
+        if game is not None:
+            render_online_game(game)
+            return
+    render_online_menu()
+
+
+def main() -> None:
+    st.set_page_config(page_title="Chess", page_icon="♟️", layout="centered", initial_sidebar_state="auto")
+    check_streamlit_version()
+    init_state()
+    render_settings()
+    if st.session_state.mode == MODE_ONLINE:
+        run_online()
+    else:
+        run_local()
 
 
 if __name__ == "__main__":
