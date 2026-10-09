@@ -960,9 +960,11 @@ ORIENTATIONS = ["Auto", "White at bottom", "Black at bottom", "Rotate every turn
 COLOR_NAME = {WHITE: "White", BLACK: "Black"}
 BLANK = "\u00a0"  # label for empty squares (st.button needs a non-empty label)
 
-LIGHT_SQ, DARK_SQ = "#f0d9b5", "#b58863"
-LAST_LIGHT, LAST_DARK = "#cdd26a", "#aaa23a"
-SELECTED_SQ = "#f7ec5d"
+# Green theme. Change these colours to re-skin the whole app.
+ACCENT, ACCENT_DARK = "#2e7d32", "#1f5f25"  # buttons, selected radio, focus rings, banners
+LIGHT_SQ, DARK_SQ = "#eeeed2", "#769656"  # the classic green board
+LAST_LIGHT, LAST_DARK = "#f5f682", "#b9ca43"  # squares of the last move
+SELECTED_SQ = "#ffe14d"  # the selected piece
 
 BASE_CSS = """
 .st-key-css_holder{display:none !important;}
@@ -978,6 +980,32 @@ BASE_CSS = """
 .st-key-board button::before{top:3px;left:4px;}
 .st-key-board button::after{bottom:3px;right:4px;}
 """
+
+
+# App-wide green theme. Streamlit has no runtime theme API, so the accent colour is applied with CSS.
+# (@ACCENT@ / @DARK@ are replaced with the constants above.)
+THEME_CSS = """
+.st-key-theme_holder{display:none !important;}
+.stApp{background-image:linear-gradient(rgba(70,150,70,.05),rgba(70,150,70,.05));}
+header[data-testid="stHeader"]{background:transparent !important;}
+section[data-testid="stSidebar"]{background-image:linear-gradient(rgba(70,150,70,.13),rgba(70,150,70,.13)) !important;border-right:1px solid rgba(70,150,70,.28);}
+button[data-testid="stBaseButton-primary"]{background-color:@ACCENT@ !important;border-color:@ACCENT@ !important;color:#fff !important;}
+button[data-testid="stBaseButton-primary"]:hover,button[data-testid="stBaseButton-primary"]:active{background-color:@DARK@ !important;border-color:@DARK@ !important;color:#fff !important;}
+button[data-testid="stBaseButton-primary"]:focus-visible{box-shadow:0 0 0 .2rem rgba(46,125,50,.4) !important;}
+button[data-testid="stBaseButton-secondary"]:hover:not(.st-key-board *){border-color:@ACCENT@ !important;color:@ACCENT@ !important;}
+button[data-testid="stBaseButton-secondary"]:focus-visible:not(.st-key-board *){border-color:@ACCENT@ !important;box-shadow:0 0 0 .2rem rgba(46,125,50,.35) !important;}
+button[data-testid="stBaseButton-secondary"]:active:not(.st-key-board *){background-color:@ACCENT@ !important;border-color:@ACCENT@ !important;color:#fff !important;}
+label[data-testid="stRadioOption"][data-selected="true"] > div > div:first-child{background-color:@ACCENT@ !important;border-color:@ACCENT@ !important;}
+[data-baseweb="select"] > div:focus-within{border-color:@ACCENT@ !important;box-shadow:0 0 0 1px @ACCENT@ !important;}
+[data-testid="stAlertContainer"]:has([data-testid="stAlertContentInfo"]){background-color:rgba(46,125,50,.13) !important;border-left:4px solid @ACCENT@;}
+[data-testid="stAlertContainer"]:has([data-testid="stAlertContentInfo"]),[data-testid="stAlertContentInfo"] *{color:inherit !important;}
+.st-key-board{border-radius:6px;overflow:hidden;box-shadow:0 3px 16px rgba(30,70,30,.35);}
+""".replace("@ACCENT@", ACCENT).replace("@DARK@", ACCENT_DARK)
+
+
+def inject_theme() -> None:
+    with st.container(key="theme_holder"):
+        st.markdown(f"<style>{THEME_CSS}</style>", unsafe_allow_html=True)
 
 
 def css_rule(selectors: List[str], declarations: str) -> str:
@@ -1017,9 +1045,9 @@ def build_board_css(game: Game, selected: Optional[Square], targets: Dict[Square
                                                  "rgba(231,0,0,.8) 25%,rgba(169,0,0,0) 89%) !important"))
     for (r, c), is_capture in targets.items():
         if is_capture:
-            img = "radial-gradient(circle,rgba(0,0,0,0) 56%,rgba(214,48,49,.75) 58%)"
+            img = "radial-gradient(circle,rgba(0,0,0,0) 56%,rgba(0,0,0,.32) 58%)"  # ring around a capturable piece
         else:
-            img = "radial-gradient(circle,rgba(20,90,40,.55) 0%,rgba(20,90,40,.55) 20%,rgba(0,0,0,0) 23%)"
+            img = "radial-gradient(circle,rgba(0,0,0,.26) 0%,rgba(0,0,0,.26) 20%,rgba(0,0,0,0) 23%)"  # dot on an empty square
         rules.append(css_rule([sq_sel(r, c)], f"background-image:{img} !important"))
     # rank numbers on the left edge, file letters along the bottom edge
     left_col, bottom_row = (7, 0) if flipped else (0, 7)
@@ -1400,7 +1428,7 @@ def render_board(game: Game, flipped: bool) -> None:
 def board_caption(game: Game) -> Optional[str]:
     ss = st.session_state
     if ss.selected and not ss.pending_promotion:
-        return (f"Selected {square_name(*ss.selected)}. Green dots show where it can move; "
+        return (f"Selected {square_name(*ss.selected)}. Dots show where it can move; "
                 f"click it again to deselect.")
     if can_move_now(game):
         return "Click one of your pieces, then click where it should go."
@@ -1629,6 +1657,7 @@ def main() -> None:
     st.set_page_config(page_title="Chess", page_icon="♟️", layout="centered", initial_sidebar_state="auto")
     check_streamlit_version()
     init_state()
+    inject_theme()
     render_settings()
     if st.session_state.mode == MODE_ONLINE:
         run_online()
