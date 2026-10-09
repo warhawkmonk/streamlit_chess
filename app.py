@@ -1340,7 +1340,7 @@ def render_settings() -> None:
     sb = st.sidebar
     ss = st.session_state
     sb.title("♟️ Chess")
-    sb.radio("Game mode", [MODE_2P, MODE_ONLINE, MODE_AI], key="mode")
+    sb.radio("Game mode", [MODE_ONLINE, MODE_AI], key="mode")
     mode = ss.mode
     if mode == MODE_ONLINE:
         with sb.expander("Your player ID (UUID)"):
